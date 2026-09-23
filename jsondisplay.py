@@ -894,7 +894,7 @@ def plot_instrument(
     # Show
     # =====================================================
 
-    fig.show()
+    return fig
 
 
 # =========================================================
@@ -995,7 +995,7 @@ def main():
     # Plot
     # -----------------------------------------------------
 
-    plot_instrument(
+    fig=plot_instrument(
         args.filename,
 
         exclude=args.exclude,
@@ -1009,6 +1009,8 @@ def main():
         zmin=args.zmin,
         zmax=args.zmax
     )
+
+    fig.show()
 
 
 # =========================================================

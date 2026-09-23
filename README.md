@@ -35,6 +35,21 @@ it is possible to have the functionality directely available in the terminal as
 jsondisplay instrument.json
 ```
 
+
+If the code should be used in a juypter-notebook, the following code can be used:
+```python
+import plotly.io as pio
+pio.renderers.default = "notebook"
+import jsondisplay
+
+fig = jsondisplay.plot_instrument(
+    "/users/christianbeck/Downloads/loki.json",  
+    zmin=-25,
+    zmax=25
+)
+
+fig.show()
+```
 ## Usage
 
 Basic usage:

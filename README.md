@@ -43,7 +43,7 @@ pio.renderers.default = "notebook"
 import jsondisplay
 
 fig = jsondisplay.plot_instrument(
-    "/users/christianbeck/Downloads/loki.json",  
+    "PATH/TO/JSON",  
     zmin=-25,
     zmax=25
 )

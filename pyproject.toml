@@ -5,13 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jsondisplay"
 version = "0.1.0"
+description = "Display and explore JSON data in a Dash web interface"
+readme = "README.md"
+requires-python = ">=3.9"
 dependencies = [
+    "dash>=2.0",
     "numpy",
-    "plotly"
+    "plotly",
 ]
-
-[tool.setuptools]
-py-modules = ["jsondisplay"]
 
 [project.scripts]
 jsondisplay = "jsondisplay:main"
+
+[tool.setuptools]
+py-modules = ["jsondisplay"]

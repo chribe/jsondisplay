@@ -28,7 +28,11 @@ Install the required packages:
 
 For development or editable installation: 
 
-```bash pip install -e . ``` 
+```bash pip install -e . ```
+
+Alternatively, install via:
+
+```bash python -m pip install git+https://github.com/chribe/jsondisplay.git ```
 
 After installation, the viewer may be available as: 
 

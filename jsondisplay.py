@@ -22,14 +22,20 @@ DEFAULT_EXCLUDE_PATTERNS = [
 ]
 
 MAX_EDITABLE_LIST_ITEMS = 50
-DOUBLE_CLICK_SECONDS = 0.40
+MAX_TREE_ITEMS = 100
 MAX_HISTORY_LENGTH = 30
+DOUBLE_CLICK_SECONDS = 0.40
+
+# A fixed value preserves the Plotly 3D camera while Dash
+# updates tree state, visibility, or JSON values.
+PLOT_UIREVISION = "nexus-json-geometry-viewer-v1"
 
 
 # =========================================================
 # General utilities
 # =========================================================
 def attrs_to_dict(attrs):
+    """Convert NeXus-style attributes into a normal dictionary."""
     result = {}
 
     if not isinstance(attrs, list):
@@ -58,7 +64,7 @@ def normalize(vector):
 
 
 def component_color(nx_class):
-    """Generate a stable colour automatically for each NX_class."""
+    """Generate a stable colour for each NX_class."""
     nx_class = str(nx_class or "unknown")
 
     digest = hashlib.md5(
@@ -81,7 +87,9 @@ def component_color(nx_class):
 
 
 def parse_exclude_patterns(text):
-    """Parse comma-, semicolon-, or newline-separated patterns."""
+    """
+    Parse comma-, semicolon-, or newline-separated patterns.
+    """
     if not text:
         return []
 
@@ -96,10 +104,8 @@ def parse_exclude_patterns(text):
 
 def component_matches_patterns(component, patterns):
     """
-    Match patterns case-insensitively against:
-      - component name
-      - NX_class
-      - full NeXus path
+    Match wildcard patterns against component name, NX_class,
+    and full NeXus path. Matching is case-insensitive.
     """
     if not patterns:
         return False
@@ -141,6 +147,7 @@ def point_in_limits(x, y, z, limits):
 
 
 def point_mask(points, limits):
+    """Return a boolean mask selecting points inside spatial limits."""
     mask = np.ones(len(points), dtype=bool)
 
     if limits["xmin"] is not None:
@@ -165,7 +172,7 @@ def point_mask(points, limits):
 
 
 def downsample_points(point_set, max_points):
-    """Limit point clouds before sending them to the browser."""
+    """Limit point clouds before sending them to Plotly."""
     point_count = len(point_set["x"])
 
     if max_points is None or point_count <= max_points:
@@ -191,44 +198,67 @@ def downsample_points(point_set, max_points):
     }
 
 
-def get_value_at_path(data, path):
+def path_key(json_path):
+    """Return a stable serialisable key for a JSON path."""
+    return json.dumps(json_path)
+
+
+def parent_path_keys(json_path):
+    """
+    Return the root and all parent JSON paths for a node.
+
+    Example:
+        ["children", 0, "children", 2]
+
+    returns keys for:
+        []
+        ["children"]
+        ["children", 0]
+        ["children", 0, "children"]
+        ["children", 0, "children", 2]
+    """
+    return [
+        path_key(json_path[:index])
+        for index in range(len(json_path) + 1)
+    ]
+
+
+def get_value_at_path(data, json_path):
     current = data
 
-    for key in path:
+    for key in json_path:
         current = current[key]
 
     return current
 
 
-def set_value_at_path(data, path, value):
+def set_value_at_path(data, json_path, value):
     current = data
 
-    for key in path[:-1]:
+    for key in json_path[:-1]:
         current = current[key]
 
-    current[path[-1]] = value
+    current[json_path[-1]] = value
 
 
 def parse_edited_value(text, old_value):
     """
-    Parse edited JSON values.
+    Convert editable text back into JSON-compatible data.
 
-    Numeric values may switch freely between integer and float:
+    Numeric values can freely transition, for example:
 
         1.5 -> 10 -> 1.5
-        2 -> 3.75 -> 4
-        1e-3 -> 10 -> -0.25
+        3 -> 2.75 -> 4
+        1e-3 -> 100 -> -0.5
     """
     text = str(text).strip()
 
     # Boolean
     if isinstance(old_value, bool):
-        lower_text = text.lower()
-
-        if lower_text in {"true", "1", "yes", "on"}:
+        if text.lower() in {"true", "1", "yes", "on"}:
             return True
 
-        if lower_text in {"false", "0", "no", "off"}:
+        if text.lower() in {"false", "0", "no", "off"}:
             return False
 
         raise ValueError(
@@ -245,19 +275,13 @@ def parse_edited_value(text, old_value):
         except json.JSONDecodeError:
             return text
 
-    # Numeric values
+    # Number
     if (
         isinstance(old_value, (int, float, np.integer, np.floating))
         and not isinstance(old_value, bool)
     ):
-        try:
-            numeric_value = float(text)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Expected numeric value, got {text!r}"
-            ) from exc
+        numeric_value = float(text)
 
-        # Integer only if entered without decimal/exponent notation.
         entered_as_integer = (
             "." not in text
             and "e" not in text.lower()
@@ -268,11 +292,11 @@ def parse_edited_value(text, old_value):
 
         return numeric_value
 
-    # Lists and dictionaries must be valid JSON.
+    # JSON list / object
     if isinstance(old_value, (list, dict)):
         return json.loads(text)
 
-    # Strings
+    # String
     return text
 
 
@@ -308,7 +332,7 @@ def homogeneous_rotation(axis, angle_deg):
 
 
 # =========================================================
-# NeXus component collection
+# NeXus components and transformations
 # =========================================================
 def collect_components(
     node,
@@ -317,10 +341,11 @@ def collect_components(
     components=None,
 ):
     """
-    Collect every node containing NX_class.
+    Collect all groups with an NX_class attribute.
 
-    json_path is used to expand the matching branch after a
-    double-click in the 3D view.
+    json_path stores the exact raw JSON location of the group.
+    It is used to lazy-open the matching tree path after a
+    double-click in the Plotly 3D view.
     """
     if components is None:
         components = []
@@ -332,6 +357,7 @@ def collect_components(
         return components
 
     name = node.get("name", "unnamed")
+
     nx_class = attrs_to_dict(
         node.get("attributes", [])
     ).get("NX_class")
@@ -359,10 +385,8 @@ def collect_components(
     return components
 
 
-# =========================================================
-# NeXus transformations
-# =========================================================
 def collect_transformations(component):
+    """Collect local transformation datasets for one component."""
     transforms = {}
 
     for child in component["node"].get("children", []):
@@ -398,6 +422,7 @@ def collect_transformations(component):
 
 
 def transform_to_matrix(transform):
+    """Convert one transformation dataset to a 4x4 matrix."""
     transform_type = transform.get("type")
     vector = transform.get("vector")
     value = transform.get("value")
@@ -425,6 +450,7 @@ def transform_to_matrix(transform):
 
 
 def resolve_transform_chain(transforms, current_name, visited=None):
+    """Resolve a local NeXus depends_on transformation chain."""
     if visited is None:
         visited = set()
 
@@ -464,6 +490,7 @@ def resolve_transform_chain(transforms, current_name, visited=None):
 
 
 def build_component_matrix(component):
+    """Build the global 4x4 transformation matrix for a component."""
     transforms = collect_transformations(component)
 
     if not transforms:
@@ -512,6 +539,7 @@ def build_component_matrix(component):
 # Geometry extraction
 # =========================================================
 def extract_child_points(component, matrix, limits=None):
+    """Extract XYZ offset datasets and transform them globally."""
     datasets = {}
     point_sets = []
 
@@ -525,12 +553,12 @@ def extract_child_points(component, matrix, limits=None):
         if name is not None:
             datasets[name] = config.get("values")
 
-    candidates = [
+    xyz_candidates = [
         ("x_pixel_offset", "y_pixel_offset", "z_pixel_offset"),
         ("x_offset", "y_offset", "z_offset"),
     ]
 
-    for x_name, y_name, z_name in candidates:
+    for x_name, y_name, z_name in xyz_candidates:
         if not all(
             name in datasets
             for name in (x_name, y_name, z_name)
@@ -589,6 +617,7 @@ def plot_instrument(
     zmax=None,
     max_points=100_000,
 ):
+    """Create the Plotly geometry figure."""
     if exclude_patterns is None:
         exclude_patterns = []
 
@@ -603,6 +632,11 @@ def plot_instrument(
 
     components = collect_components(data)
     figure = go.Figure()
+
+    # Used to create symmetric X/Y ranges, placing (0, 0)
+    # in the centre of the initial view.
+    x_abs_max = 0.0
+    y_abs_max = 0.0
 
     for component in components:
         component["trace_indices"] = []
@@ -622,32 +656,42 @@ def plot_instrument(
 
         matrix = build_component_matrix(component)
         origin = matrix @ np.array([0, 0, 0, 1], dtype=float)
+
         x0, y0, z0 = origin[:3]
 
         if not point_in_limits(x0, y0, z0, limits):
             continue
 
+        x_abs_max = max(x_abs_max, abs(float(x0)))
+        y_abs_max = max(y_abs_max, abs(float(y0)))
+
         colour = component_color(component["nx_class"])
 
-        component["trace_indices"].append(
-            len(figure.data)
-        )
+        component["trace_indices"].append(len(figure.data))
 
         figure.add_trace(
             go.Scatter3d(
                 x=[x0],
                 y=[y0],
                 z=[z0],
-                customdata=[component["path"]],
                 mode="markers+text",
                 name=component["name"],
                 text=[component["name"]],
                 textposition="top center",
                 visible=visible,
+
+                # Store component path once per trace.
+                meta={
+                    "component_path": component["path"],
+                },
+
                 marker=dict(
                     size=8,
                     color=colour,
-                    line=dict(color="black", width=1),
+                    line=dict(
+                        color="black",
+                        width=1,
+                    ),
                 ),
                 hovertext=[
                     (
@@ -661,13 +705,11 @@ def plot_instrument(
             )
         )
 
-        point_sets = extract_child_points(
+        for point_set in extract_child_points(
             component,
             matrix,
             limits,
-        )
-
-        for point_set in point_sets:
+        ):
             if len(point_set["x"]) == 0:
                 continue
 
@@ -676,42 +718,105 @@ def plot_instrument(
                 max_points,
             )
 
-            component["trace_indices"].append(
-                len(figure.data)
+            x_abs_max = max(
+                x_abs_max,
+                float(np.max(np.abs(point_set["x"]))),
             )
+
+            y_abs_max = max(
+                y_abs_max,
+                float(np.max(np.abs(point_set["y"]))),
+            )
+
+            component["trace_indices"].append(len(figure.data))
 
             figure.add_trace(
                 go.Scatter3d(
                     x=point_set["x"],
                     y=point_set["y"],
                     z=point_set["z"],
-                    customdata=np.full(
-                        len(point_set["x"]),
-                        component["path"],
-                        dtype=object,
-                    ),
                     mode="markers",
                     name=point_set["name"],
                     visible=visible,
+
+                    # Stored once per trace, rather than once
+                    # for every detector/pixel point.
+                    meta={
+                        "component_path": component["path"],
+                    },
+
                     marker=dict(
                         size=1.5,
                         color=colour,
                         opacity=0.25,
                     ),
-                    hoverinfo="skip",
+
+                    # Keeps points clickable while hiding hover text.
+                    hoverinfo="none",
                 )
             )
 
+    # Ensure usable default ranges even for empty geometry.
+    x_abs_max = max(x_abs_max, 1.0)
+    y_abs_max = max(y_abs_max, 1.0)
+
+    x_range = [-x_abs_max, x_abs_max]
+    y_range = [-y_abs_max, y_abs_max]
+
     figure.update_layout(
         title=f"NeXus JSON Geometry: {json_file}",
+
+        # Keep camera orientation, zoom, and pan while Dash
+        # updates the figure in response to UI events.
+        uirevision=PLOT_UIREVISION,
+
         scene=dict(
-            xaxis_title="X [m]",
-            yaxis_title="Y [m]",
-            zaxis_title="Z [m]",
+            xaxis=dict(
+                title="X [m]",
+                range=x_range,
+            ),
+            yaxis=dict(
+                title="Y [m]",
+                range=y_range,
+            ),
+            zaxis=dict(
+                title="Z [m]",
+            ),
+
+            # Keep aspect ratios based on the data.
             aspectmode="data",
+
+            # Preserve scene camera state after updates.
+            uirevision=PLOT_UIREVISION,
+
+            # Initial viewing orientation. The symmetric X/Y
+            # ranges place global X=0 and Y=0 in the centre.
+            camera=dict(
+                eye=dict(
+                    x=1.5,
+                    y=1.5,
+                    z=1.5,
+                ),
+                up=dict(
+                    x=0,
+                    y=0,
+                    z=1,
+                ),
+                center=dict(
+                    x=0,
+                    y=0,
+                    z=0,
+                ),
+            ),
         ),
+
         height=900,
-        margin=dict(l=0, r=0, t=50, b=0),
+        margin=dict(
+            l=0,
+            r=0,
+            t=50,
+            b=0,
+        ),
         showlegend=True,
     )
 
@@ -719,7 +824,7 @@ def plot_instrument(
 
 
 # =========================================================
-# JSON tree rendering
+# Lazy JSON tree rendering
 # =========================================================
 def component_tree_style(selected=False):
     style = {
@@ -739,22 +844,22 @@ def component_tree_style(selected=False):
 
 
 def array_summary(value):
-    if not value:
+    if len(value) == 0:
         return "empty list"
 
-    if isinstance(value[0], (int, float)):
+    first = value[0]
+
+    if isinstance(first, (int, float)):
         return f"numeric array, {len(value):,} values"
+
+    if isinstance(first, str):
+        return f"string array, {len(value):,} values"
 
     return f"list, {len(value):,} items"
 
 
 def editable_input(name, value, json_path):
-    """
-    Render an editable scalar/small-list input.
-
-    Numeric fields always use step='any', allowing transitions such as:
-        1.5 -> 10 -> 1.5
-    """
+    """Render an editable scalar or a small JSON list/object."""
     if isinstance(value, bool):
         raw_value = "true" if value else "false"
         value_type = "boolean"
@@ -778,7 +883,7 @@ def editable_input(name, value, json_path):
     input_properties = {
         "id": {
             "type": "json-edit",
-            "path": json.dumps(json_path),
+            "path": path_key(json_path),
         },
         "value": raw_value,
         "debounce": True,
@@ -824,28 +929,46 @@ def editable_input(name, value, json_path):
     )
 
 
-def json_tree_node(
+def lazy_json_tree_node(
     name,
     value,
     json_path,
-    component_lookup,
+    component_by_json_path,
     hidden_paths,
-    selected_path=None,
-    selected_json_path=None,
-    max_items=100,
-    open_node=False,
+    open_paths,
+    selected_component_path=None,
 ):
-    summary_style = {
-        "fontWeight": "600",
+    """
+    Render one JSON tree node.
+
+    Child nodes are only rendered when this node is open.
+    This prevents construction of a very large hidden DOM tree.
+    """
+    current_path_key = path_key(json_path)
+    is_open = current_path_key in open_paths
+
+    component = component_by_json_path.get(
+        current_path_key
+    )
+
+    base_style = {
         "fontFamily": "monospace",
         "fontSize": "13px",
-        "cursor": "pointer",
         "padding": "2px 0",
     }
 
+    toggle_style = {
+        "border": "none",
+        "background": "transparent",
+        "cursor": "pointer",
+        "padding": "0 5px 0 0",
+        "fontSize": "12px",
+        "width": "24px",
+    }
+
     children_style = {
-        "paddingLeft": "14px",
-        "marginLeft": "4px",
+        "paddingLeft": "18px",
+        "marginLeft": "6px",
         "borderLeft": "1px solid #d0d0d0",
     }
 
@@ -858,166 +981,196 @@ def json_tree_node(
         "textOverflow": "ellipsis",
     }
 
-    open_selected_branch = (
-        selected_json_path is not None
-        and json_path == selected_json_path[:len(json_path)]
-    )
-
-    should_open = open_node or open_selected_branch
-
     # -----------------------------------------------------
     # JSON object
     # -----------------------------------------------------
     if isinstance(value, dict):
-        component = component_lookup.get(id(value))
-        items = list(value.items())
+        node_style = dict(base_style)
 
-        children = [
-            json_tree_node(
-                name=str(key),
-                value=child_value,
-                json_path=json_path + [key],
-                component_lookup=component_lookup,
-                hidden_paths=hidden_paths,
-                selected_path=selected_path,
-                selected_json_path=selected_json_path,
-                max_items=max_items,
+        if (
+            component is not None
+            and component["path"] == selected_component_path
+        ):
+            node_style.update(
+                component_tree_style(selected=True)
             )
-            for key, child_value in items[:max_items]
+
+        header = [
+            html.Button(
+                "▼" if is_open else "▶",
+                id={
+                    "type": "json-tree-toggle",
+                    "path": current_path_key,
+                },
+                n_clicks=0,
+                style=toggle_style,
+            )
         ]
 
-        if len(items) > max_items:
-            children.append(
-                html.Div(
-                    f"... {len(items) - max_items} more keys",
-                    style=leaf_style,
+        if component is not None:
+            component_path = component["path"]
+
+            header.extend([
+                dcc.Checklist(
+                    id={
+                        "type": "component-visibility",
+                        "path": component_path,
+                    },
+                    options=[
+                        {
+                            "label": (
+                                f"{name} "
+                                f"[{component['nx_class']}]"
+                            ),
+                            "value": component_path,
+                        }
+                    ],
+                    value=(
+                        []
+                        if component_path in hidden_paths
+                        else [component_path]
+                    ),
+                    inline=True,
+                    style={
+                        "display": "inline-block",
+                        "fontFamily": "monospace",
+                        "fontSize": "13px",
+                        "fontWeight": "600",
+                    },
+                    inputStyle={
+                        "marginRight": "5px",
+                    },
+                ),
+                html.Span(
+                    f" {{ {len(value)} }}",
+                    style={"color": "#666"},
+                ),
+            ])
+
+        else:
+            header.append(
+                html.Span(
+                    f"{name} {{ {len(value)} }}",
+                    style={"fontWeight": "600"},
                 )
             )
 
-        details_kwargs = {
-            "open": should_open,
-        }
+        children = []
 
-        if component is None:
-            summary = html.Span(
-                f"{name} {{ {len(items)} }}",
-                style=summary_style,
-            )
+        # Lazy loading: build object children only when open.
+        if is_open:
+            visible_items = list(value.items())[:MAX_TREE_ITEMS]
 
-        else:
-            component_path = component["path"]
+            children = [
+                lazy_json_tree_node(
+                    name=str(child_name),
+                    value=child_value,
+                    json_path=json_path + [child_name],
+                    component_by_json_path=component_by_json_path,
+                    hidden_paths=hidden_paths,
+                    open_paths=open_paths,
+                    selected_component_path=selected_component_path,
+                )
+                for child_name, child_value in visible_items
+            ]
 
-            details_kwargs["id"] = {
-                "type": "component-tree-node",
-                "path": component_path,
-            }
+            if len(value) > MAX_TREE_ITEMS:
+                children.append(
+                    html.Div(
+                        f"... {len(value) - MAX_TREE_ITEMS} more keys",
+                        style=leaf_style,
+                    )
+                )
 
-            details_kwargs["style"] = component_tree_style(
-                selected=(component_path == selected_path)
-            )
-
-            summary = html.Span(
-                [
-                    dcc.Checklist(
-                        id={
-                            "type": "component-visibility",
-                            "path": component_path,
-                        },
-                        options=[
-                            {
-                                "label": (
-                                    f"{name} "
-                                    f"[{component['nx_class']}]"
-                                ),
-                                "value": component_path,
-                            }
-                        ],
-                        value=(
-                            []
-                            if component_path in hidden_paths
-                            else [component_path]
-                        ),
-                        inline=True,
-                        style={
-                            "display": "inline-block",
-                            "fontFamily": "monospace",
-                            "fontSize": "13px",
-                            "fontWeight": "600",
-                            "marginRight": "8px",
-                        },
-                        inputStyle={
-                            "marginRight": "5px",
-                        },
-                    ),
-                    html.Span(
-                        f"{{ {len(items)} }}",
-                        style={
-                            "fontFamily": "monospace",
-                            "color": "#666",
-                        },
-                    ),
-                ]
-            )
-
-        return html.Details(
+        return html.Div(
             [
-                html.Summary(summary),
-                html.Div(children, style=children_style),
-            ],
-            **details_kwargs,
+                html.Div(header, style=node_style),
+                html.Div(children, style=children_style)
+                if is_open
+                else None,
+            ]
         )
 
     # -----------------------------------------------------
     # JSON list
     # -----------------------------------------------------
     if isinstance(value, list):
-        if name in {"children", "attributes"}:
+        structural_lists = {"children", "attributes"}
+
+        # Data arrays are either editable when small or summarised.
+        if name not in structural_lists:
+            if len(value) <= MAX_EDITABLE_LIST_ITEMS:
+                return editable_input(
+                    name,
+                    value,
+                    json_path,
+                )
+
+            return html.Div(
+                f"{name}: [{array_summary(value)}]",
+                style=leaf_style,
+            )
+
+        children = []
+
+        # Lazy loading: structural list entries only exist
+        # after the list has been opened.
+        if is_open:
+            visible_items = value[:MAX_TREE_ITEMS]
+
             children = [
-                json_tree_node(
+                lazy_json_tree_node(
                     name=f"[{index}]",
                     value=item,
                     json_path=json_path + [index],
-                    component_lookup=component_lookup,
+                    component_by_json_path=component_by_json_path,
                     hidden_paths=hidden_paths,
-                    selected_path=selected_path,
-                    selected_json_path=selected_json_path,
-                    max_items=max_items,
+                    open_paths=open_paths,
+                    selected_component_path=selected_component_path,
                 )
-                for index, item in enumerate(value[:max_items])
+                for index, item in enumerate(visible_items)
             ]
 
-            if len(value) > max_items:
+            if len(value) > MAX_TREE_ITEMS:
                 children.append(
                     html.Div(
-                        f"... {len(value) - max_items} more items",
+                        f"... {len(value) - MAX_TREE_ITEMS} more items",
                         style=leaf_style,
                     )
                 )
 
-            return html.Details(
-                [
-                    html.Summary(
-                        f"{name} [ {len(value)} ]",
-                        style=summary_style,
-                    ),
-                    html.Div(children, style=children_style),
-                ],
-                open=should_open,
-            )
-
-        if len(value) <= MAX_EDITABLE_LIST_ITEMS:
-            return editable_input(
-                name,
-                value,
-                json_path,
-            )
-
         return html.Div(
-            f"{name}: [{array_summary(value)}]",
-            style=leaf_style,
+            [
+                html.Div(
+                    [
+                        html.Button(
+                            "▼" if is_open else "▶",
+                            id={
+                                "type": "json-tree-toggle",
+                                "path": current_path_key,
+                            },
+                            n_clicks=0,
+                            style=toggle_style,
+                        ),
+                        html.Span(
+                            f"{name} [ {len(value)} ]",
+                            style={
+                                "fontWeight": "600",
+                                "fontFamily": "monospace",
+                            },
+                        ),
+                    ],
+                    style=base_style,
+                ),
+                html.Div(children, style=children_style)
+                if is_open
+                else None,
+            ]
         )
 
-    # Scalar
+    # -----------------------------------------------------
+    # JSON scalar
+    # -----------------------------------------------------
     return editable_input(name, value, json_path)
 
 
@@ -1046,41 +1199,41 @@ def show_instrument_viewer(
         )
     }
 
-    trace_map = {
-        component["path"]: {
-            "trace_indices": component["trace_indices"],
-            "name": component["name"],
-            "nx_class": component["nx_class"],
-            "path": component["path"],
-        }
+    initial_visible_paths = {
+        component["path"]
         for component in components
+        if component["path"] not in initial_hidden_paths
     }
 
-    def build_tree(tree_data, hidden_paths, selected_path=None):
-        tree_components = collect_components(tree_data)
+    trace_path_map = {}
 
-        component_lookup = {
-            id(component["node"]): component
-            for component in tree_components
+    for component in components:
+        for trace_index in component["trace_indices"]:
+            trace_path_map[
+                str(trace_index)
+            ] = component["path"]
+
+    def build_tree(
+        tree_data,
+        hidden_paths,
+        open_paths,
+        selected_component_path=None,
+    ):
+        current_components = collect_components(tree_data)
+
+        component_by_json_path = {
+            path_key(component["json_path"]): component
+            for component in current_components
         }
 
-        selected_json_path = None
-
-        for component in tree_components:
-            if component["path"] == selected_path:
-                selected_json_path = component["json_path"]
-                break
-
-        return json_tree_node(
+        return lazy_json_tree_node(
             name="root",
             value=tree_data,
             json_path=[],
-            component_lookup=component_lookup,
-            hidden_paths=hidden_paths,
-            selected_path=selected_path,
-            selected_json_path=selected_json_path,
-            max_items=100,
-            open_node=True,
+            component_by_json_path=component_by_json_path,
+            hidden_paths=set(hidden_paths),
+            open_paths=set(open_paths),
+            selected_component_path=selected_component_path,
         )
 
     app.layout = html.Div(
@@ -1098,12 +1251,20 @@ def show_instrument_viewer(
                 data=[],
             ),
             dcc.Store(
-                id="component-trace-map",
-                data=trace_map,
+                id="visible-component-paths",
+                data=list(initial_visible_paths),
+            ),
+            dcc.Store(
+                id="trace-path-map",
+                data=trace_path_map,
             ),
             dcc.Store(
                 id="selected-component-path",
                 data=None,
+            ),
+            dcc.Store(
+                id="open-json-paths",
+                data=["[]"],
             ),
             dcc.Store(
                 id="plot-click-state",
@@ -1115,13 +1276,16 @@ def show_instrument_viewer(
             dcc.Download(id="download-json"),
 
             # -------------------------------------------------
-            # Left resizable JSON panel
+            # Left JSON tree / editing panel
             # -------------------------------------------------
             html.Div(
                 [
                     html.H3(
                         "JSON structure",
-                        style={"marginTop": "0"},
+                        style={
+                            "marginTop": "0",
+                            "marginBottom": "8px",
+                        },
                     ),
 
                     html.Div(
@@ -1157,15 +1321,22 @@ def show_instrument_viewer(
                                 "Save JSON...",
                                 id="save-json",
                                 n_clicks=0,
-                                style={"cursor": "pointer"},
+                                style={
+                                    "cursor": "pointer",
+                                },
                             ),
                         ],
-                        style={"marginBottom": "12px"},
+                        style={
+                            "marginBottom": "12px",
+                        },
                     ),
 
                     html.Div(
                         "Exclude from 3D view",
-                        style={"fontWeight": "bold"},
+                        style={
+                            "fontWeight": "bold",
+                            "fontSize": "13px",
+                        },
                     ),
 
                     dcc.Input(
@@ -1216,20 +1387,23 @@ def show_instrument_viewer(
                                 "Reset",
                                 id="reset-default-exclusions",
                                 n_clicks=0,
-                                style={"cursor": "pointer"},
+                                style={
+                                    "cursor": "pointer",
+                                },
                             ),
                         ],
-                        style={"marginBottom": "12px"},
+                        style={
+                            "marginBottom": "12px",
+                        },
                     ),
 
                     html.Div(
                         (
-                            "Edit values, then click Update geometry. "
-                            "Undo/Redo restores JSON states and rebuilds "
-                            "the plot. Numeric fields accept integers, "
-                            "decimals and scientific notation. "
-                            "Double-click a plotted point to open and "
-                            "highlight its corresponding component."
+                            "Only open JSON branches are loaded. "
+                            "Click ▶ to open a branch. "
+                            "Double-click a 3D point to open and "
+                            "highlight its matching component. "
+                            "Single plot clicks do nothing."
                         ),
                         style={
                             "fontSize": "12px",
@@ -1241,8 +1415,9 @@ def show_instrument_viewer(
                     html.Div(
                         id="json-tree",
                         children=build_tree(
-                            data,
-                            initial_hidden_paths,
+                            tree_data=data,
+                            hidden_paths=initial_hidden_paths,
+                            open_paths={"[]"},
                         ),
                     ),
                 ],
@@ -1262,7 +1437,7 @@ def show_instrument_viewer(
             ),
 
             # -------------------------------------------------
-            # Right Plotly panel
+            # Right Plotly 3D panel
             # -------------------------------------------------
             html.Div(
                 [
@@ -1272,6 +1447,10 @@ def show_instrument_viewer(
                         config={
                             "responsive": True,
                             "displaylogo": False,
+
+                            # Disable Plotly's normal double-click
+                            # camera reset. Double-click is used for
+                            # JSON-tree navigation instead.
                             "doubleClick": False,
                         },
                         style={
@@ -1298,7 +1477,7 @@ def show_instrument_viewer(
     )
 
     # ---------------------------------------------------------
-    # Save JSON through browser download dialog
+    # Save modified JSON
     # ---------------------------------------------------------
     @app.callback(
         Output("download-json", "data"),
@@ -1317,18 +1496,189 @@ def show_instrument_viewer(
         )
 
     # ---------------------------------------------------------
-    # Main application callback
+    # Tree expansion and plot double-click handling
+    #
+    # One callback updates open-json-paths, avoiding duplicate
+    # Dash callback outputs.
+    # ---------------------------------------------------------
+    @app.callback(
+        Output("open-json-paths", "data"),
+        Output("selected-component-path", "data"),
+        Output("plot-click-state", "data"),
+
+        Input(
+            {
+                "type": "json-tree-toggle",
+                "path": ALL,
+            },
+            "n_clicks",
+        ),
+        Input("instrument-geometry", "clickData"),
+
+        State("open-json-paths", "data"),
+        State("plot-click-state", "data"),
+        State("trace-path-map", "data"),
+        State("json-data-store", "data"),
+
+        prevent_initial_call=True,
+    )
+    def open_tree_branch_or_select_plot_point(
+        _toggle_clicks,
+        click_data,
+        open_paths,
+        click_state,
+        current_trace_path_map,
+        current_data,
+    ):
+        triggered = ctx.triggered_id
+        open_paths = set(open_paths or [])
+        open_paths.add("[]")
+
+        if click_state is None:
+            click_state = {
+                "path": None,
+                "time": 0.0,
+            }
+
+        # -------------------------------------------------
+        # Expand/collapse a tree node
+        # -------------------------------------------------
+        if (
+            isinstance(triggered, dict)
+            and triggered.get("type") == "json-tree-toggle"
+        ):
+            clicked_path_key = triggered["path"]
+
+            if clicked_path_key in open_paths:
+                if clicked_path_key != "[]":
+                    open_paths.remove(clicked_path_key)
+            else:
+                open_paths.add(clicked_path_key)
+
+            return (
+                list(open_paths),
+                no_update,
+                no_update,
+            )
+
+        # -------------------------------------------------
+        # Plot single/double click
+        # -------------------------------------------------
+        if triggered == "instrument-geometry":
+            if not click_data or not click_data.get("points"):
+                return no_update, no_update, no_update
+
+            point = click_data["points"][0]
+            curve_number = point.get("curveNumber")
+
+            if curve_number is None:
+                return no_update, no_update, no_update
+
+            clicked_component_path = current_trace_path_map.get(
+                str(curve_number)
+            )
+
+            if clicked_component_path is None:
+                return no_update, no_update, no_update
+
+            now = time.monotonic()
+
+            is_double_click = (
+                clicked_component_path == click_state.get("path")
+                and now - click_state.get("time", 0.0)
+                <= DOUBLE_CLICK_SECONDS
+            )
+
+            new_click_state = {
+                "path": clicked_component_path,
+                "time": now,
+            }
+
+            # Single click changes nothing visibly.
+            if not is_double_click:
+                return (
+                    no_update,
+                    no_update,
+                    new_click_state,
+                )
+
+            selected_component = next(
+                (
+                    component
+                    for component in collect_components(current_data)
+                    if component["path"] == clicked_component_path
+                ),
+                None,
+            )
+
+            if selected_component is None:
+                return (
+                    no_update,
+                    no_update,
+                    new_click_state,
+                )
+
+            # Open root and every branch leading to the
+            # selected component.
+            open_paths.update(
+                parent_path_keys(
+                    selected_component["json_path"]
+                )
+            )
+
+            return (
+                list(open_paths),
+                clicked_component_path,
+                new_click_state,
+            )
+
+        return no_update, no_update, no_update
+
+    # ---------------------------------------------------------
+    # Render only currently open tree branches
+    # ---------------------------------------------------------
+    @app.callback(
+        Output("json-tree", "children"),
+
+        Input("json-data-store", "data"),
+        Input("open-json-paths", "data"),
+        Input("selected-component-path", "data"),
+        Input("visible-component-paths", "data"),
+    )
+    def render_json_tree(
+        current_data,
+        open_paths,
+        selected_component_path,
+        visible_paths,
+    ):
+        current_components = collect_components(current_data)
+
+        all_paths = {
+            component["path"]
+            for component in current_components
+        }
+
+        hidden_paths = all_paths - set(visible_paths or [])
+
+        return build_tree(
+            tree_data=current_data,
+            hidden_paths=hidden_paths,
+            open_paths=set(open_paths or ["[]"]),
+            selected_component_path=selected_component_path,
+        )
+
+    # ---------------------------------------------------------
+    # Main state update: editing, visibility, undo/redo,
+    # and explicit geometry rebuilding.
     # ---------------------------------------------------------
     @app.callback(
         Output("instrument-geometry", "figure"),
         Output("json-data-store", "data"),
         Output("undo-history-store", "data"),
         Output("redo-history-store", "data"),
-        Output("component-trace-map", "data"),
-        Output("json-tree", "children"),
+        Output("visible-component-paths", "data"),
+        Output("trace-path-map", "data"),
         Output("exclude-patterns", "value"),
-        Output("selected-component-path", "data"),
-        Output("plot-click-state", "data"),
 
         Input(
             {
@@ -1351,7 +1701,6 @@ def show_instrument_viewer(
         Input("update-geometry", "n_clicks"),
         Input("undo-json-edit", "n_clicks"),
         Input("redo-json-edit", "n_clicks"),
-        Input("instrument-geometry", "clickData"),
 
         State("exclude-patterns", "value"),
         State(
@@ -1371,14 +1720,13 @@ def show_instrument_viewer(
         State("json-data-store", "data"),
         State("undo-history-store", "data"),
         State("redo-history-store", "data"),
+        State("visible-component-paths", "data"),
         State("instrument-geometry", "figure"),
-        State("component-trace-map", "data"),
-        State("selected-component-path", "data"),
-        State("plot-click-state", "data"),
+        State("trace-path-map", "data"),
 
         prevent_initial_call=True,
     )
-    def update_viewer(
+    def update_viewer_state(
         checkbox_values,
         edit_values,
         _apply_clicks,
@@ -1388,103 +1736,43 @@ def show_instrument_viewer(
         _update_geometry_clicks,
         _undo_clicks,
         _redo_clicks,
-        click_data,
         exclude_text,
         checkbox_ids,
         edit_ids,
         current_data,
         undo_history,
         redo_history,
+        current_visible_paths,
         current_figure,
-        current_trace_map,
-        selected_path,
-        click_state,
+        current_trace_path_map,
     ):
         triggered = ctx.triggered_id
-        new_data = copy.deepcopy(current_data)
 
+        new_data = copy.deepcopy(current_data)
         undo_history = undo_history or []
         redo_history = redo_history or []
-
-        if click_state is None:
-            click_state = {
-                "path": None,
-                "time": 0.0,
-            }
-
-        new_click_state = click_state
 
         exclude_patterns = parse_exclude_patterns(
             exclude_text
         )
 
-        all_paths = list(current_trace_map.keys())
+        current_components = collect_components(new_data)
 
-        checked_paths = {
-            item_id["path"]
-            for values, item_id in zip(
-                checkbox_values,
-                checkbox_ids,
-            )
-            if item_id["path"] in (values or [])
+        all_component_paths = {
+            component["path"]
+            for component in current_components
         }
 
-        # -------------------------------------------------
-        # Single click: do nothing visibly.
-        # Double click: open/highlight corresponding tree node.
-        # -------------------------------------------------
-        if triggered == "instrument-geometry":
-            clicked_path = None
-
-            if click_data and click_data.get("points"):
-                clicked_path = click_data["points"][0].get(
-                    "customdata"
-                )
-
-                if isinstance(clicked_path, list):
-                    clicked_path = (
-                        clicked_path[0]
-                        if clicked_path
-                        else None
-                    )
-
-            now = time.monotonic()
-
-            is_double_click = (
-                clicked_path is not None
-                and clicked_path == click_state.get("path")
-                and now - click_state.get("time", 0.0)
-                <= DOUBLE_CLICK_SECONDS
-            )
-
-            new_click_state = {
-                "path": clicked_path,
-                "time": now,
-            }
-
-            if not is_double_click:
-                return (
-                    no_update,        # figure
-                    no_update,        # JSON data
-                    no_update,        # undo history
-                    no_update,        # redo history
-                    no_update,        # trace map
-                    no_update,        # tree
-                    no_update,        # exclusions
-                    no_update,        # selected path
-                    new_click_state,  # click state
-                )
-
-            selected_path = clicked_path
+        visible_paths = set(current_visible_paths or [])
 
         # -------------------------------------------------
-        # Apply JSON edits and save previous data in history
+        # Apply one JSON edit
         # -------------------------------------------------
         if (
             isinstance(triggered, dict)
             and triggered.get("type") == "json-edit"
         ):
-            previous_data = copy.deepcopy(current_data)
+            old_data_snapshot = copy.deepcopy(current_data)
             changed = False
 
             for value, item_id in zip(edit_values, edit_ids):
@@ -1516,96 +1804,119 @@ def show_instrument_viewer(
                     IndexError,
                     json.JSONDecodeError,
                 ):
-                    # Ignore invalid input until corrected.
+                    # Invalid input is ignored until corrected.
                     pass
 
             if changed:
-                undo_history.append(previous_data)
+                undo_history.append(old_data_snapshot)
                 undo_history = undo_history[-MAX_HISTORY_LENGTH:]
 
-                # New edits invalidate the redo branch.
+                # A new edit clears redo history.
                 redo_history = []
 
         # -------------------------------------------------
-        # Undo / redo JSON state
+        # Undo / redo
         # -------------------------------------------------
-        history_restore = False
+        if triggered == "undo-json-edit" and undo_history:
+            redo_history.append(copy.deepcopy(current_data))
+            redo_history = redo_history[-MAX_HISTORY_LENGTH:]
 
-        if triggered == "undo-json-edit":
-            if undo_history:
-                redo_history.append(
-                    copy.deepcopy(current_data)
-                )
-                redo_history = redo_history[-MAX_HISTORY_LENGTH:]
+            new_data = undo_history.pop()
 
-                new_data = undo_history.pop()
-                history_restore = True
+        elif triggered == "redo-json-edit" and redo_history:
+            undo_history.append(copy.deepcopy(current_data))
+            undo_history = undo_history[-MAX_HISTORY_LENGTH:]
 
-        elif triggered == "redo-json-edit":
-            if redo_history:
-                undo_history.append(
-                    copy.deepcopy(current_data)
-                )
-                undo_history = undo_history[-MAX_HISTORY_LENGTH:]
+            new_data = redo_history.pop()
 
-                new_data = redo_history.pop()
-                history_restore = True
+        updated_components = collect_components(new_data)
+
+        updated_component_paths = {
+            component["path"]
+            for component in updated_components
+        }
+
+        component_by_path = {
+            component["path"]: component
+            for component in updated_components
+        }
 
         # -------------------------------------------------
-        # Visibility selection
+        # Visibility handling
         # -------------------------------------------------
         if triggered == "hide-all-components":
             visible_paths = set()
 
         elif triggered == "show-all-components":
-            visible_paths = set()
+            visible_paths = set(updated_component_paths)
             exclude_text = ""
             exclude_patterns = []
 
-            # All currently known components become visible.
-            visible_paths = set(all_paths)
-
         elif triggered == "reset-default-exclusions":
             exclude_patterns = DEFAULT_EXCLUDE_PATTERNS
+
             exclude_text = ", ".join(
                 DEFAULT_EXCLUDE_PATTERNS
             )
 
             visible_paths = {
-                path
-                for path, metadata in current_trace_map.items()
+                component["path"]
+                for component in updated_components
                 if not component_matches_patterns(
-                    metadata,
+                    component,
                     exclude_patterns,
                 )
             }
 
         elif triggered == "apply-exclusions":
             visible_paths = {
-                path
-                for path, metadata in current_trace_map.items()
+                component["path"]
+                for component in updated_components
                 if not component_matches_patterns(
-                    metadata,
+                    component,
                     exclude_patterns,
                 )
             }
 
-        else:
-            visible_paths = {
-                path
-                for path in checked_paths
-                if path in current_trace_map
-                and not component_matches_patterns(
-                    current_trace_map[path],
+        elif (
+            isinstance(triggered, dict)
+            and triggered.get("type") == "component-visibility"
+        ):
+            # Update only the clicked checkbox. This is important
+            # for lazy loading: unopened component checkboxes do not
+            # exist in the browser and must retain their state.
+            changed_path = triggered["path"]
+
+            changed_values = []
+
+            for values, checkbox_id in zip(
+                checkbox_values,
+                checkbox_ids,
+            ):
+                if checkbox_id["path"] == changed_path:
+                    changed_values = values or []
+                    break
+
+            component = component_by_path.get(changed_path)
+
+            if component is not None:
+                is_checked = changed_path in changed_values
+                is_excluded = component_matches_patterns(
+                    component,
                     exclude_patterns,
                 )
-            }
+
+                if is_checked and not is_excluded:
+                    visible_paths.add(changed_path)
+                else:
+                    visible_paths.discard(changed_path)
+
+        # Remove paths that no longer exist after edits/undo/redo.
+        visible_paths &= updated_component_paths
 
         # -------------------------------------------------
-        # Rebuild geometry:
-        # - explicit Update geometry
-        # - Undo
-        # - Redo
+        # Rebuild geometry only after explicit Update,
+        # Undo, or Redo.
         # -------------------------------------------------
         rebuild_geometry = (
             triggered == "update-geometry"
@@ -1614,7 +1925,7 @@ def show_instrument_viewer(
         )
 
         if rebuild_geometry:
-            new_figure, new_components = plot_instrument(
+            new_figure, plotted_components = plot_instrument(
                 data=new_data,
                 json_file="modified JSON",
                 exclude_patterns=exclude_patterns,
@@ -1630,77 +1941,37 @@ def show_instrument_viewer(
 
             current_figure = new_figure.to_dict()
 
-            current_trace_map = {
-                component["path"]: {
-                    "trace_indices": component["trace_indices"],
-                    "name": component["name"],
-                    "nx_class": component["nx_class"],
-                    "path": component["path"],
-                }
-                for component in new_components
-            }
+            current_trace_path_map = {}
 
-            all_paths = list(current_trace_map.keys())
-
-            visible_paths = {
-                path
-                for path in visible_paths
-                if path in current_trace_map
-            }
+            for component in plotted_components:
+                for trace_index in component["trace_indices"]:
+                    current_trace_path_map[
+                        str(trace_index)
+                    ] = component["path"]
 
         # -------------------------------------------------
-        # Update visibility of already-created traces
+        # Update visibility without rebuilding geometry.
+        # The constant uirevision preserves the current camera.
         # -------------------------------------------------
-        for path, metadata in current_trace_map.items():
-            trace_visible = path in visible_paths
+        if current_figure:
+            for trace_index_text, component_path in (
+                current_trace_path_map.items()
+            ):
+                trace_index = int(trace_index_text)
 
-            for trace_index in metadata["trace_indices"]:
                 if trace_index < len(current_figure["data"]):
                     current_figure["data"][trace_index][
                         "visible"
-                    ] = trace_visible
-
-        hidden_paths = set(all_paths) - visible_paths
-
-        # -------------------------------------------------
-        # Preserve existing expanded/collapsed HTML Details state:
-        # - ordinary JSON edits
-        # - Update geometry
-        #
-        # Undo/redo recreates tree inputs, so it intentionally
-        # rebuilds the tree in order to show restored values.
-        # -------------------------------------------------
-        preserve_tree_state = (
-            triggered == "update-geometry"
-            or (
-                isinstance(triggered, dict)
-                and triggered.get("type") == "json-edit"
-            )
-        )
-
-        if history_restore:
-            preserve_tree_state = False
-
-        if preserve_tree_state:
-            tree = no_update
-
-        else:
-            tree = build_tree(
-                new_data,
-                hidden_paths,
-                selected_path=selected_path,
-            )
+                    ] = component_path in visible_paths
 
         return (
             current_figure,
             new_data,
             undo_history,
             redo_history,
-            current_trace_map,
-            tree,
+            list(visible_paths),
+            current_trace_path_map,
             exclude_text,
-            selected_path,
-            new_click_state,
         )
 
     host = "127.0.0.1"
@@ -1739,10 +2010,7 @@ def main():
         "--exclude",
         nargs="+",
         default=[],
-        help=(
-            "Additional initially excluded wildcard patterns. "
-            "Example: --exclude 'monitor*' 'NXdetector'"
-        ),
+        help="Additional initial wildcard exclusion patterns.",
     )
 
     parser.add_argument("--xmin", type=float)
@@ -1757,8 +2025,8 @@ def main():
         type=int,
         default=100_000,
         help=(
-            "Maximum child geometry points per component "
-            "sent to the browser. Default: 100000."
+            "Maximum child geometry points per component. "
+            "Default: 100000."
         ),
     )
 

@@ -26,8 +26,8 @@ MAX_TREE_ITEMS = 100
 MAX_HISTORY_LENGTH = 30
 DOUBLE_CLICK_SECONDS = 0.40
 
-# A fixed value preserves the Plotly 3D camera while Dash
-# updates tree state, visibility, or JSON values.
+# A stable uirevision preserves the camera while Dash updates
+# the figure for visibility, tree selection, or other controls.
 PLOT_UIREVISION = "nexus-json-geometry-viewer-v1"
 
 
@@ -35,7 +35,6 @@ PLOT_UIREVISION = "nexus-json-geometry-viewer-v1"
 # General utilities
 # =========================================================
 def attrs_to_dict(attrs):
-    """Convert NeXus-style attributes into a normal dictionary."""
     result = {}
 
     if not isinstance(attrs, list):
@@ -64,7 +63,7 @@ def normalize(vector):
 
 
 def component_color(nx_class):
-    """Generate a stable colour for each NX_class."""
+    """Generate a stable colour automatically for each NX_class."""
     nx_class = str(nx_class or "unknown")
 
     digest = hashlib.md5(
@@ -72,7 +71,6 @@ def component_color(nx_class):
     ).hexdigest()
 
     hue = int(digest[:8], 16) / 0xFFFFFFFF
-
     red, green, blue = colorsys.hsv_to_rgb(
         hue,
         0.70,
@@ -87,9 +85,7 @@ def component_color(nx_class):
 
 
 def parse_exclude_patterns(text):
-    """
-    Parse comma-, semicolon-, or newline-separated patterns.
-    """
+    """Parse comma-, semicolon-, or newline-separated patterns."""
     if not text:
         return []
 
@@ -104,8 +100,8 @@ def parse_exclude_patterns(text):
 
 def component_matches_patterns(component, patterns):
     """
-    Match wildcard patterns against component name, NX_class,
-    and full NeXus path. Matching is case-insensitive.
+    Match patterns against component name, NX_class, and full path.
+    Matching is case-insensitive.
     """
     if not patterns:
         return False
@@ -129,6 +125,25 @@ def component_matches_patterns(component, patterns):
     return False
 
 
+def validate_limits(limits):
+    """Validate that minimum axis limits do not exceed maximum limits."""
+    for axis in ("x", "y", "z"):
+        minimum = limits[f"{axis}min"]
+        maximum = limits[f"{axis}max"]
+
+        if (
+            minimum is not None
+            and maximum is not None
+            and minimum > maximum
+        ):
+            raise ValueError(
+                f"{axis}min ({minimum}) must not be greater than "
+                f"{axis}max ({maximum})."
+            )
+
+    return limits
+
+
 def point_in_limits(x, y, z, limits):
     if limits["xmin"] is not None and x < limits["xmin"]:
         return False
@@ -147,7 +162,6 @@ def point_in_limits(x, y, z, limits):
 
 
 def point_mask(points, limits):
-    """Return a boolean mask selecting points inside spatial limits."""
     mask = np.ones(len(points), dtype=bool)
 
     if limits["xmin"] is not None:
@@ -172,7 +186,7 @@ def point_mask(points, limits):
 
 
 def downsample_points(point_set, max_points):
-    """Limit point clouds before sending them to Plotly."""
+    """Limit point clouds before sending them to the browser."""
     point_count = len(point_set["x"])
 
     if max_points is None or point_count <= max_points:
@@ -199,24 +213,12 @@ def downsample_points(point_set, max_points):
 
 
 def path_key(json_path):
-    """Return a stable serialisable key for a JSON path."""
+    """Create a serialisable stable key for a raw JSON path."""
     return json.dumps(json_path)
 
 
 def parent_path_keys(json_path):
-    """
-    Return the root and all parent JSON paths for a node.
-
-    Example:
-        ["children", 0, "children", 2]
-
-    returns keys for:
-        []
-        ["children"]
-        ["children", 0]
-        ["children", 0, "children"]
-        ["children", 0, "children", 2]
-    """
+    """Return root and all parents required to show a JSON node."""
     return [
         path_key(json_path[:index])
         for index in range(len(json_path) + 1)
@@ -243,17 +245,14 @@ def set_value_at_path(data, json_path, value):
 
 def parse_edited_value(text, old_value):
     """
-    Convert editable text back into JSON-compatible data.
+    Convert edited text to a JSON-compatible type.
 
-    Numeric values can freely transition, for example:
+    Numeric entries may freely change between floats and integers:
 
         1.5 -> 10 -> 1.5
-        3 -> 2.75 -> 4
-        1e-3 -> 100 -> -0.5
     """
     text = str(text).strip()
 
-    # Boolean
     if isinstance(old_value, bool):
         if text.lower() in {"true", "1", "yes", "on"}:
             return True
@@ -265,7 +264,6 @@ def parse_edited_value(text, old_value):
             f"Expected boolean value, got {text!r}"
         )
 
-    # Null
     if old_value is None:
         if text.lower() == "null":
             return None
@@ -275,7 +273,6 @@ def parse_edited_value(text, old_value):
         except json.JSONDecodeError:
             return text
 
-    # Number
     if (
         isinstance(old_value, (int, float, np.integer, np.floating))
         and not isinstance(old_value, bool)
@@ -292,11 +289,9 @@ def parse_edited_value(text, old_value):
 
         return numeric_value
 
-    # JSON list / object
     if isinstance(old_value, (list, dict)):
         return json.loads(text)
 
-    # String
     return text
 
 
@@ -332,7 +327,7 @@ def homogeneous_rotation(axis, angle_deg):
 
 
 # =========================================================
-# NeXus components and transformations
+# NeXus component collection and transformations
 # =========================================================
 def collect_components(
     node,
@@ -341,11 +336,9 @@ def collect_components(
     components=None,
 ):
     """
-    Collect all groups with an NX_class attribute.
+    Collect all groups that have an NX_class attribute.
 
-    json_path stores the exact raw JSON location of the group.
-    It is used to lazy-open the matching tree path after a
-    double-click in the Plotly 3D view.
+    json_path identifies the node inside the raw JSON document.
     """
     if components is None:
         components = []
@@ -386,7 +379,6 @@ def collect_components(
 
 
 def collect_transformations(component):
-    """Collect local transformation datasets for one component."""
     transforms = {}
 
     for child in component["node"].get("children", []):
@@ -422,7 +414,6 @@ def collect_transformations(component):
 
 
 def transform_to_matrix(transform):
-    """Convert one transformation dataset to a 4x4 matrix."""
     transform_type = transform.get("type")
     vector = transform.get("vector")
     value = transform.get("value")
@@ -450,7 +441,6 @@ def transform_to_matrix(transform):
 
 
 def resolve_transform_chain(transforms, current_name, visited=None):
-    """Resolve a local NeXus depends_on transformation chain."""
     if visited is None:
         visited = set()
 
@@ -490,7 +480,6 @@ def resolve_transform_chain(transforms, current_name, visited=None):
 
 
 def build_component_matrix(component):
-    """Build the global 4x4 transformation matrix for a component."""
     transforms = collect_transformations(component)
 
     if not transforms:
@@ -539,7 +528,6 @@ def build_component_matrix(component):
 # Geometry extraction
 # =========================================================
 def extract_child_points(component, matrix, limits=None):
-    """Extract XYZ offset datasets and transform them globally."""
     datasets = {}
     point_sets = []
 
@@ -617,7 +605,7 @@ def plot_instrument(
     zmax=None,
     max_points=100_000,
 ):
-    """Create the Plotly geometry figure."""
+    """Build the Plotly 3D geometry figure."""
     if exclude_patterns is None:
         exclude_patterns = []
 
@@ -633,8 +621,7 @@ def plot_instrument(
     components = collect_components(data)
     figure = go.Figure()
 
-    # Used to create symmetric X/Y ranges, placing (0, 0)
-    # in the centre of the initial view.
+    # Track extents so X=0 and Y=0 are centred initially.
     x_abs_max = 0.0
     y_abs_max = 0.0
 
@@ -679,12 +666,9 @@ def plot_instrument(
                 text=[component["name"]],
                 textposition="top center",
                 visible=visible,
-
-                # Store component path once per trace.
                 meta={
                     "component_path": component["path"],
                 },
-
                 marker=dict(
                     size=8,
                     color=colour,
@@ -738,59 +722,41 @@ def plot_instrument(
                     mode="markers",
                     name=point_set["name"],
                     visible=visible,
-
-                    # Stored once per trace, rather than once
-                    # for every detector/pixel point.
                     meta={
                         "component_path": component["path"],
                     },
-
                     marker=dict(
                         size=1.5,
                         color=colour,
                         opacity=0.25,
                     ),
 
-                    # Keeps points clickable while hiding hover text.
+                    # No hover box, but still receives click events.
                     hoverinfo="none",
                 )
             )
 
-    # Ensure usable default ranges even for empty geometry.
     x_abs_max = max(x_abs_max, 1.0)
     y_abs_max = max(y_abs_max, 1.0)
 
-    x_range = [-x_abs_max, x_abs_max]
-    y_range = [-y_abs_max, y_abs_max]
-
     figure.update_layout(
         title=f"NeXus JSON Geometry: {json_file}",
-
-        # Keep camera orientation, zoom, and pan while Dash
-        # updates the figure in response to UI events.
         uirevision=PLOT_UIREVISION,
 
         scene=dict(
             xaxis=dict(
                 title="X [m]",
-                range=x_range,
+                range=[-x_abs_max, x_abs_max],
             ),
             yaxis=dict(
                 title="Y [m]",
-                range=y_range,
+                range=[-y_abs_max, y_abs_max],
             ),
             zaxis=dict(
                 title="Z [m]",
             ),
-
-            # Keep aspect ratios based on the data.
             aspectmode="data",
-
-            # Preserve scene camera state after updates.
             uirevision=PLOT_UIREVISION,
-
-            # Initial viewing orientation. The symmetric X/Y
-            # ranges place global X=0 and Y=0 in the centre.
             camera=dict(
                 eye=dict(
                     x=1.5,
@@ -859,7 +825,7 @@ def array_summary(value):
 
 
 def editable_input(name, value, json_path):
-    """Render an editable scalar or a small JSON list/object."""
+    """Render editable scalar values and small lists/objects."""
     if isinstance(value, bool):
         raw_value = "true" if value else "false"
         value_type = "boolean"
@@ -941,8 +907,7 @@ def lazy_json_tree_node(
     """
     Render one JSON tree node.
 
-    Child nodes are only rendered when this node is open.
-    This prevents construction of a very large hidden DOM tree.
+    Child nodes are created only when this branch is open.
     """
     current_path_key = path_key(json_path)
     is_open = current_path_key in open_paths
@@ -1057,7 +1022,6 @@ def lazy_json_tree_node(
 
         children = []
 
-        # Lazy loading: build object children only when open.
         if is_open:
             visible_items = list(value.items())[:MAX_TREE_ITEMS]
 
@@ -1097,7 +1061,6 @@ def lazy_json_tree_node(
     if isinstance(value, list):
         structural_lists = {"children", "attributes"}
 
-        # Data arrays are either editable when small or summarised.
         if name not in structural_lists:
             if len(value) <= MAX_EDITABLE_LIST_ITEMS:
                 return editable_input(
@@ -1113,8 +1076,6 @@ def lazy_json_tree_node(
 
         children = []
 
-        # Lazy loading: structural list entries only exist
-        # after the list has been opened.
         if is_open:
             visible_items = value[:MAX_TREE_ITEMS]
 
@@ -1175,7 +1136,7 @@ def lazy_json_tree_node(
 
 
 # =========================================================
-# Dash viewer
+# Dash application
 # =========================================================
 def show_instrument_viewer(
     figure,
@@ -1236,6 +1197,30 @@ def show_instrument_viewer(
             selected_component_path=selected_component_path,
         )
 
+    def number_input(
+        component_id,
+        value,
+        placeholder,
+        margin_right=False,
+    ):
+        style = {
+            "width": "48%",
+            "boxSizing": "border-box",
+            "fontFamily": "monospace",
+        }
+
+        if margin_right:
+            style["marginRight"] = "4%"
+
+        return dcc.Input(
+            id=component_id,
+            type="number",
+            value=value,
+            placeholder=placeholder,
+            step="any",
+            style=style,
+        )
+
     app.layout = html.Div(
         [
             dcc.Store(
@@ -1259,6 +1244,10 @@ def show_instrument_viewer(
                 data=trace_path_map,
             ),
             dcc.Store(
+                id="spatial-limits-store",
+                data=limits,
+            ),
+            dcc.Store(
                 id="selected-component-path",
                 data=None,
             ),
@@ -1276,7 +1265,7 @@ def show_instrument_viewer(
             dcc.Download(id="download-json"),
 
             # -------------------------------------------------
-            # Left JSON tree / editing panel
+            # Left JSON tree / control panel
             # -------------------------------------------------
             html.Div(
                 [
@@ -1331,6 +1320,83 @@ def show_instrument_viewer(
                         },
                     ),
 
+                    # -----------------------------------------
+                    # Spatial limits GUI
+                    # -----------------------------------------
+                    html.Div(
+                        "Spatial limits [m]",
+                        style={
+                            "fontWeight": "bold",
+                            "fontSize": "13px",
+                            "marginTop": "10px",
+                            "marginBottom": "4px",
+                        },
+                    ),
+
+                    html.Div(
+                        [
+                            number_input(
+                                "gui-xmin",
+                                limits["xmin"],
+                                "xmin",
+                                margin_right=True,
+                            ),
+                            number_input(
+                                "gui-xmax",
+                                limits["xmax"],
+                                "xmax",
+                            ),
+                        ],
+                        style={"marginBottom": "5px"},
+                    ),
+
+                    html.Div(
+                        [
+                            number_input(
+                                "gui-ymin",
+                                limits["ymin"],
+                                "ymin",
+                                margin_right=True,
+                            ),
+                            number_input(
+                                "gui-ymax",
+                                limits["ymax"],
+                                "ymax",
+                            ),
+                        ],
+                        style={"marginBottom": "5px"},
+                    ),
+
+                    html.Div(
+                        [
+                            number_input(
+                                "gui-zmin",
+                                limits["zmin"],
+                                "zmin",
+                                margin_right=True,
+                            ),
+                            number_input(
+                                "gui-zmax",
+                                limits["zmax"],
+                                "zmax",
+                            ),
+                        ],
+                        style={"marginBottom": "6px"},
+                    ),
+
+                    html.Button(
+                        "Apply limits",
+                        id="apply-spatial-limits",
+                        n_clicks=0,
+                        style={
+                            "cursor": "pointer",
+                            "marginBottom": "12px",
+                        },
+                    ),
+
+                    # -----------------------------------------
+                    # Exclusions
+                    # -----------------------------------------
                     html.Div(
                         "Exclude from 3D view",
                         style={
@@ -1448,9 +1514,8 @@ def show_instrument_viewer(
                             "responsive": True,
                             "displaylogo": False,
 
-                            # Disable Plotly's normal double-click
-                            # camera reset. Double-click is used for
-                            # JSON-tree navigation instead.
+                            # Double click is used for JSON-tree
+                            # navigation, not for resetting the camera.
                             "doubleClick": False,
                         },
                         style={
@@ -1496,10 +1561,7 @@ def show_instrument_viewer(
         )
 
     # ---------------------------------------------------------
-    # Tree expansion and plot double-click handling
-    #
-    # One callback updates open-json-paths, avoiding duplicate
-    # Dash callback outputs.
+    # Tree open/collapse and Plotly double-click selection
     # ---------------------------------------------------------
     @app.callback(
         Output("open-json-paths", "data"),
@@ -1540,9 +1602,7 @@ def show_instrument_viewer(
                 "time": 0.0,
             }
 
-        # -------------------------------------------------
-        # Expand/collapse a tree node
-        # -------------------------------------------------
+        # Tree branch expand/collapse
         if (
             isinstance(triggered, dict)
             and triggered.get("type") == "json-tree-toggle"
@@ -1561,9 +1621,7 @@ def show_instrument_viewer(
                 no_update,
             )
 
-        # -------------------------------------------------
-        # Plot single/double click
-        # -------------------------------------------------
+        # Plot double-click logic
         if triggered == "instrument-geometry":
             if not click_data or not click_data.get("points"):
                 return no_update, no_update, no_update
@@ -1594,7 +1652,7 @@ def show_instrument_viewer(
                 "time": now,
             }
 
-            # Single click changes nothing visibly.
+            # Single click: nothing visible changes.
             if not is_double_click:
                 return (
                     no_update,
@@ -1618,8 +1676,6 @@ def show_instrument_viewer(
                     new_click_state,
                 )
 
-            # Open root and every branch leading to the
-            # selected component.
             open_paths.update(
                 parent_path_keys(
                     selected_component["json_path"]
@@ -1635,7 +1691,7 @@ def show_instrument_viewer(
         return no_update, no_update, no_update
 
     # ---------------------------------------------------------
-    # Render only currently open tree branches
+    # Render only currently opened JSON branches
     # ---------------------------------------------------------
     @app.callback(
         Output("json-tree", "children"),
@@ -1668,8 +1724,8 @@ def show_instrument_viewer(
         )
 
     # ---------------------------------------------------------
-    # Main state update: editing, visibility, undo/redo,
-    # and explicit geometry rebuilding.
+    # Main state callback: editing, visibility, geometry,
+    # undo/redo, and spatial limits.
     # ---------------------------------------------------------
     @app.callback(
         Output("instrument-geometry", "figure"),
@@ -1678,6 +1734,7 @@ def show_instrument_viewer(
         Output("redo-history-store", "data"),
         Output("visible-component-paths", "data"),
         Output("trace-path-map", "data"),
+        Output("spatial-limits-store", "data"),
         Output("exclude-patterns", "value"),
 
         Input(
@@ -1699,6 +1756,7 @@ def show_instrument_viewer(
         Input("show-all-components", "n_clicks"),
         Input("reset-default-exclusions", "n_clicks"),
         Input("update-geometry", "n_clicks"),
+        Input("apply-spatial-limits", "n_clicks"),
         Input("undo-json-edit", "n_clicks"),
         Input("redo-json-edit", "n_clicks"),
 
@@ -1717,6 +1775,15 @@ def show_instrument_viewer(
             },
             "id",
         ),
+
+        State("gui-xmin", "value"),
+        State("gui-xmax", "value"),
+        State("gui-ymin", "value"),
+        State("gui-ymax", "value"),
+        State("gui-zmin", "value"),
+        State("gui-zmax", "value"),
+        State("spatial-limits-store", "data"),
+
         State("json-data-store", "data"),
         State("undo-history-store", "data"),
         State("redo-history-store", "data"),
@@ -1734,11 +1801,19 @@ def show_instrument_viewer(
         _show_all_clicks,
         _reset_clicks,
         _update_geometry_clicks,
+        _apply_spatial_limits_clicks,
         _undo_clicks,
         _redo_clicks,
         exclude_text,
         checkbox_ids,
         edit_ids,
+        gui_xmin,
+        gui_xmax,
+        gui_ymin,
+        gui_ymax,
+        gui_zmin,
+        gui_zmax,
+        current_limits,
         current_data,
         undo_history,
         redo_history,
@@ -1752,21 +1827,16 @@ def show_instrument_viewer(
         undo_history = undo_history or []
         redo_history = redo_history or []
 
+        active_limits = dict(current_limits or limits)
+
         exclude_patterns = parse_exclude_patterns(
             exclude_text
         )
 
-        current_components = collect_components(new_data)
-
-        all_component_paths = {
-            component["path"]
-            for component in current_components
-        }
-
         visible_paths = set(current_visible_paths or [])
 
         # -------------------------------------------------
-        # Apply one JSON edit
+        # Apply JSON edit
         # -------------------------------------------------
         if (
             isinstance(triggered, dict)
@@ -1804,14 +1874,12 @@ def show_instrument_viewer(
                     IndexError,
                     json.JSONDecodeError,
                 ):
-                    # Invalid input is ignored until corrected.
+                    # Invalid text is ignored until corrected.
                     pass
 
             if changed:
                 undo_history.append(old_data_snapshot)
                 undo_history = undo_history[-MAX_HISTORY_LENGTH:]
-
-                # A new edit clears redo history.
                 redo_history = []
 
         # -------------------------------------------------
@@ -1820,14 +1888,25 @@ def show_instrument_viewer(
         if triggered == "undo-json-edit" and undo_history:
             redo_history.append(copy.deepcopy(current_data))
             redo_history = redo_history[-MAX_HISTORY_LENGTH:]
-
             new_data = undo_history.pop()
 
         elif triggered == "redo-json-edit" and redo_history:
             undo_history.append(copy.deepcopy(current_data))
             undo_history = undo_history[-MAX_HISTORY_LENGTH:]
-
             new_data = redo_history.pop()
+
+        # -------------------------------------------------
+        # Apply spatial limits from GUI
+        # -------------------------------------------------
+        if triggered == "apply-spatial-limits":
+            active_limits = validate_limits({
+                "xmin": gui_xmin,
+                "xmax": gui_xmax,
+                "ymin": gui_ymin,
+                "ymax": gui_ymax,
+                "zmin": gui_zmin,
+                "zmax": gui_zmax,
+            })
 
         updated_components = collect_components(new_data)
 
@@ -1842,7 +1921,7 @@ def show_instrument_viewer(
         }
 
         # -------------------------------------------------
-        # Visibility handling
+        # Visibility controls
         # -------------------------------------------------
         if triggered == "hide-all-components":
             visible_paths = set()
@@ -1854,7 +1933,6 @@ def show_instrument_viewer(
 
         elif triggered == "reset-default-exclusions":
             exclude_patterns = DEFAULT_EXCLUDE_PATTERNS
-
             exclude_text = ", ".join(
                 DEFAULT_EXCLUDE_PATTERNS
             )
@@ -1882,11 +1960,7 @@ def show_instrument_viewer(
             isinstance(triggered, dict)
             and triggered.get("type") == "component-visibility"
         ):
-            # Update only the clicked checkbox. This is important
-            # for lazy loading: unopened component checkboxes do not
-            # exist in the browser and must retain their state.
             changed_path = triggered["path"]
-
             changed_values = []
 
             for values, checkbox_id in zip(
@@ -1911,15 +1985,16 @@ def show_instrument_viewer(
                 else:
                     visible_paths.discard(changed_path)
 
-        # Remove paths that no longer exist after edits/undo/redo.
+        # Discard visibility references to components that no
+        # longer exist after undo/redo or JSON edits.
         visible_paths &= updated_component_paths
 
         # -------------------------------------------------
-        # Rebuild geometry only after explicit Update,
-        # Undo, or Redo.
+        # Rebuild geometry only when necessary
         # -------------------------------------------------
         rebuild_geometry = (
             triggered == "update-geometry"
+            or triggered == "apply-spatial-limits"
             or triggered == "undo-json-edit"
             or triggered == "redo-json-edit"
         )
@@ -1930,17 +2005,16 @@ def show_instrument_viewer(
                 json_file="modified JSON",
                 exclude_patterns=exclude_patterns,
                 visible_paths=visible_paths,
-                xmin=limits["xmin"],
-                xmax=limits["xmax"],
-                ymin=limits["ymin"],
-                ymax=limits["ymax"],
-                zmin=limits["zmin"],
-                zmax=limits["zmax"],
+                xmin=active_limits["xmin"],
+                xmax=active_limits["xmax"],
+                ymin=active_limits["ymin"],
+                ymax=active_limits["ymax"],
+                zmin=active_limits["zmin"],
+                zmax=active_limits["zmax"],
                 max_points=max_points,
             )
 
             current_figure = new_figure.to_dict()
-
             current_trace_path_map = {}
 
             for component in plotted_components:
@@ -1950,8 +2024,9 @@ def show_instrument_viewer(
                     ] = component["path"]
 
         # -------------------------------------------------
-        # Update visibility without rebuilding geometry.
-        # The constant uirevision preserves the current camera.
+        # Update visibility of existing traces.
+        #
+        # uirevision preserves the current 3D camera view.
         # -------------------------------------------------
         if current_figure:
             for trace_index_text, component_path in (
@@ -1971,6 +2046,7 @@ def show_instrument_viewer(
             redo_history,
             list(visible_paths),
             current_trace_path_map,
+            active_limits,
             exclude_text,
         )
 
@@ -2042,14 +2118,14 @@ def main():
     with open(args.filename, "r", encoding="utf-8") as file:
         data = json.load(file)
 
-    limits = {
+    limits = validate_limits({
         "xmin": args.xmin,
         "xmax": args.xmax,
         "ymin": args.ymin,
         "ymax": args.ymax,
         "zmin": args.zmin,
         "zmax": args.zmax,
-    }
+    })
 
     initial_exclude_patterns = (
         DEFAULT_EXCLUDE_PATTERNS
@@ -2060,12 +2136,12 @@ def main():
         data=data,
         json_file=args.filename,
         exclude_patterns=initial_exclude_patterns,
-        xmin=args.xmin,
-        xmax=args.xmax,
-        ymin=args.ymin,
-        ymax=args.ymax,
-        zmin=args.zmin,
-        zmax=args.zmax,
+        xmin=limits["xmin"],
+        xmax=limits["xmax"],
+        ymin=limits["ymin"],
+        ymax=limits["ymax"],
+        zmin=limits["zmin"],
+        zmax=limits["zmax"],
         max_points=args.max_points,
     )
 
